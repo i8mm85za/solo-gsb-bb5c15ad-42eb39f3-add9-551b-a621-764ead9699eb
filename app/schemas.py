@@ -303,3 +303,103 @@ class RetentionPlanResponse(BaseModel):
         ..., description="被保留的增量，按 (from_serial, to_serial) 升序",
     )
     results: List[RetentionPlanItem]
+
+
+# ---------------------------------------------------------------------------
+# POST /domain-retention-plan
+# ---------------------------------------------------------------------------
+
+
+class DomainRetentionReplica(RetentionReplica):
+    """单个副本：当前序列号 + 非负 priority + 非空 failure_domain。"""
+
+    failure_domain: str = Field(
+        ..., min_length=1, description="故障域标识（不可为空；不同副本可同域）",
+    )
+
+    @field_validator("failure_domain")
+    @classmethod
+    def _failure_domain_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("failure_domain 不能为空")
+        return value
+
+
+class DomainRetentionPlanRequest(BaseModel):
+    """POST /domain-retention-plan 请求体。"""
+
+    target: int = Field(..., description="目标 32 位无符号 SOA 序列号")
+    replicas: List[DomainRetentionReplica] = Field(
+        ...,
+        min_length=1,
+        description=f"副本列表（至多 {MAX_RETENTION_REPLICAS} 个，每个带非空 failure_domain）",
+    )
+    deltas: List[SizedIxfrDelta] = Field(
+        ...,
+        description=(
+            "一组带字节数的无序 IXFR 增量"
+            "（允许完全相同的重复，分叉 / 字节数冲突将被拒绝）"
+        ),
+    )
+    budget: int = Field(..., description="总字节预算（非负整数）")
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _target_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("budget", mode="before")
+    @classmethod
+    def _budget_non_negative(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "字节预算")
+
+
+class DomainRetentionPlanItem(BaseModel):
+    """单个副本的按域保留规划结果（顺序与请求中的副本一致）。"""
+
+    name: str
+    current: int
+    target: int
+    failure_domain: str = Field(..., description="副本所属故障域（回显请求值）")
+    mode: TransferMode = Field(
+        ...,
+        description=(
+            "up_to_date：当前值已等于目标；ixfr：保留的增量覆盖了到目标的"
+            "完整链；axfr：完整链不可达或未被保留"
+        ),
+    )
+    reason: Optional[RetentionReason] = Field(
+        ...,
+        description=(
+            "仅 axfr 时给出原因：gap / loop / target_incomparable / budget"
+            "（完整集合下存在完整链，但因预算未被保留）"
+        ),
+    )
+
+
+class DomainCoverageSummary(BaseModel):
+    """单个故障域的覆盖汇总。"""
+
+    failure_domain: str
+    covered_priority: int = Field(
+        ..., ge=0, description="该域内被覆盖副本（ixfr / up_to_date）的 priority 总和",
+    )
+    total_priority: int = Field(
+        ..., ge=0, description="该域内全体副本的 priority 总和",
+    )
+
+
+class DomainRetentionPlanResponse(BaseModel):
+    """POST /domain-retention-plan 响应体。"""
+
+    target: int
+    budget: int
+    used_bytes: int = Field(..., description="被保留增量占用的总字节数")
+    retained_deltas: List[RetainedDelta] = Field(
+        ..., description="被保留的增量，按 (from_serial, to_serial) 升序",
+    )
+    results: List[DomainRetentionPlanItem]
+    domains: List[DomainCoverageSummary] = Field(
+        ..., description="按 failure_domain 字典序排列的各域覆盖汇总",
+    )

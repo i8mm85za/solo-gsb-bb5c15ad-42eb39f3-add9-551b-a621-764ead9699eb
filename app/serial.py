@@ -102,7 +102,8 @@ BUDGET = "budget"
 """完整增量集合下存在到目标的完整链，但受字节预算限制未被保留。"""
 
 MAX_RETENTION_REPLICAS = 12
-"""POST /retention-plan 允许的副本数上限（选择算法枚举副本子集，复杂度 2^n）。"""
+"""POST /retention-plan 与 POST /domain-retention-plan 允许的副本数上限
+（选择算法枚举副本子集，复杂度 2^n）。"""
 
 
 class DeltaValidationError(ValueError):
@@ -411,3 +412,172 @@ def plan_retention(
         else:
             results.append((AXFR, BUDGET))
     return retained, used_bytes, results
+
+
+# ---------------------------------------------------------------------------
+# 按故障域的增量保留规划（POST /domain-retention-plan）
+# ---------------------------------------------------------------------------
+
+
+def plan_domain_retention(
+    target: int,
+    replicas: List[Tuple[int, int, str]],
+    chain: dict,
+    sizes: dict,
+    budget: int,
+) -> Tuple[
+    List[Tuple[int, int]],
+    int,
+    List[Tuple[str, Optional[str]]],
+    List[Tuple[str, int, int]],
+]:
+    """在字节预算内按故障域公平性选择要保留的增量子集。
+
+    *replicas* 为 ``(current, priority, failure_domain)`` 三元组（至多
+    ``MAX_RETENTION_REPLICAS`` 个）；其余参数与 :func:`plan_retention` 相同。
+    增量校验、逐副本链路原因（``gap`` / ``loop`` / ``target_incomparable`` /
+    ``budget``）与副本子集枚举方式完全复用既有实现，仅优化目标不同。
+
+    在所有满足 ``字节总数 <= budget`` 的保留子集中，依次：
+
+    1. **字典序最大化按域覆盖 priority 升序向量**：对每个故障域求该域内被
+       覆盖副本（``ixfr`` 与 ``up_to_date``，含零覆盖域）的 priority 总和，
+       将这些总和排成升序向量，取字典序最大者（类似最大最小公平：先抬升
+       覆盖最少的域）；
+    2. 最大化全体被覆盖副本的 priority 总和；
+    3. 最大化被覆盖副本数；
+    4. 最小化占用字节数；
+    5. 取按 ``(from_serial, to_serial)`` 升序排列的增量序列中字典序最小者。
+
+    返回 ``(retained, used_bytes, results, domains)``：前三项语义与
+    :func:`plan_retention` 相同；``domains`` 为按 ``failure_domain`` 字典序
+    排列的 ``(failure_domain, covered_priority, total_priority)`` 列表。
+    """
+    # 增量按 (from_serial, to_serial) 升序编号：按位展开即为有序序列
+    edges = sorted(sizes)
+    edge_id = {edge: i for i, edge in enumerate(edges)}
+    edge_bytes = [sizes[edge] for edge in edges]
+
+    # 第一遍：完整集合上判定，求出每个副本的需求集（增量位掩码）
+    # None 表示完整集合下即不可达（gap / loop / target_incomparable）
+    req_masks: List[Optional[int]] = []
+    inherent_reasons: List[Optional[str]] = []
+    for current, _priority, _domain in replicas:
+        mode, reason, ordered = plan_transfer(current, target, chain)
+        if mode == IXFR:
+            mask = 0
+            for edge in ordered:
+                mask |= 1 << edge_id[edge]
+            req_masks.append(mask)
+            inherent_reasons.append(None)
+        elif mode == UP_TO_DATE:
+            req_masks.append(0)
+            inherent_reasons.append(None)
+        else:
+            req_masks.append(None)
+            inherent_reasons.append(reason)
+
+    # 各域全体副本 priority 总和（含不可达副本，与保留选择无关，恒定）
+    domain_total: dict = {}
+    for _current, prio, domain in replicas:
+        domain_total[domain] = domain_total.get(domain, 0) + prio
+    # 域顺序固定为 failure_domain 字典序，保证向量与汇总输出可复现
+    domain_order = sorted(domain_total)
+
+    # up_to_date 副本恒被覆盖，作为常量计入目标函数
+    base_domain_prio = {domain: 0 for domain in domain_order}
+    base_prio = 0
+    base_count = 0
+    for (_current, prio, domain), mask in zip(replicas, req_masks):
+        if mask == 0:
+            base_domain_prio[domain] += prio
+            base_prio += prio
+            base_count += 1
+
+    # 只需枚举"完整集合下为 ixfr"的副本子集（至多 12 个 -> 至多 4096 个子集）
+    enum_idx = [i for i, mask in enumerate(req_masks) if mask]
+    reqs = [req_masks[i] for i in enum_idx]
+    prios = [replicas[i][1] for i in enum_idx]
+    dom_names = [replicas[i][2] for i in enum_idx]
+    k = len(enum_idx)
+
+    union_of = [0] * (1 << k)
+    # (按域升序向量, 全体覆盖 priority, 覆盖副本数, -占用字节)，整体字典序最大
+    best_key: Optional[Tuple[tuple, int, int, int]] = None
+    best_subsets: List[int] = []
+    for subset in range(1 << k):
+        lsb = subset & (-subset)
+        if lsb:
+            union = union_of[subset ^ lsb] | reqs[lsb.bit_length() - 1]
+        else:
+            union = 0
+        union_of[subset] = union
+
+        used = 0
+        bits = union
+        while bits:
+            bit = bits & (-bits)
+            used += edge_bytes[bit.bit_length() - 1]
+            bits ^= bit
+        if used > budget:
+            continue
+
+        covered_domain = dict(base_domain_prio)
+        prio = base_prio
+        count = base_count
+        for req, p, domain in zip(reqs, prios, dom_names):
+            if req & ~union == 0:  # 需求集被保留集包含即被覆盖
+                covered_domain[domain] += p
+                prio += p
+                count += 1
+
+        # 各域（含零覆盖域）已覆盖 priority 总和的升序向量
+        vector = tuple(sorted(covered_domain.values()))
+        key = (vector, prio, count, -used)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_subsets = [subset]
+        elif key == best_key:
+            best_subsets.append(subset)
+
+    # 最后一级：增量序列（按 (from_serial, to_serial) 升序）字典序最小
+    best_union = 0
+    best_sequence: Optional[List[Tuple[int, int]]] = None
+    for subset in best_subsets:
+        union = union_of[subset]
+        sequence: List[Tuple[int, int]] = []
+        bits = union
+        while bits:
+            bit = bits & (-bits)
+            sequence.append(edges[bit.bit_length() - 1])
+            bits ^= bit
+        if best_sequence is None or sequence < best_sequence:
+            best_sequence = sequence
+            best_union = union
+
+    # 空子集恒可行（budget >= 0），best_sequence 必非 None
+    assert best_sequence is not None
+    retained = best_sequence
+    used_bytes = sum(sizes[edge] for edge in retained)
+
+    # 最优保留集下的按域汇总
+    covered_domain = {domain: 0 for domain in domain_order}
+    for (_current, prio, domain), mask in zip(replicas, req_masks):
+        if mask is not None and mask & ~best_union == 0:
+            covered_domain[domain] += prio
+    domains = [
+        (domain, covered_domain[domain], domain_total[domain])
+        for domain in domain_order
+    ]
+
+    results: List[Tuple[str, Optional[str]]] = []
+    for mask, reason in zip(req_masks, inherent_reasons):
+        if mask is None:
+            results.append((AXFR, reason))
+        elif mask == 0:
+            results.append((UP_TO_DATE, None))
+        elif mask & ~best_union == 0:
+            results.append((IXFR, None))
+        else:
+            results.append((AXFR, BUDGET))
+    return retained, used_bytes, results, domains
