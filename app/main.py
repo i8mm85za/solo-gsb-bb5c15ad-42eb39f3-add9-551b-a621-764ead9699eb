@@ -9,6 +9,10 @@ from .schemas import (
     AuditItem,
     AuditRequest,
     AuditResponse,
+    DomainRetentionPlanItem,
+    DomainRetentionPlanRequest,
+    DomainRetentionPlanResponse,
+    DomainSummary,
     OrderedDelta,
     ProposeItem,
     ProposeRequest,
@@ -28,6 +32,7 @@ from .serial import (
     compare_serial,
     DeltaValidationError,
     forward_distance,
+    plan_domain_retention,
     plan_retention,
     plan_transfer,
     propose_serial,
@@ -38,9 +43,9 @@ app = FastAPI(
     description=(
         "基于 RFC 1982 环形算术，对多个 DNS 副本的 SOA 序列号推进进行审计，"
         "推导对所有副本都严格更新的最佳拟发布值，规划增量 / 全量传输，"
-        "并在字节预算内选择要保留的增量集合。"
+        "并在字节预算内选择要保留的增量集合（支持按故障域公平分配）。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -263,4 +268,92 @@ def retention_plan(request: RetentionPlanRequest) -> RetentionPlanResponse:
             for frm, to in retained
         ],
         results=results,
+    )
+
+
+@app.post("/domain-retention-plan", response_model=DomainRetentionPlanResponse)
+def domain_retention_plan(
+    request: DomainRetentionPlanRequest,
+) -> DomainRetentionPlanResponse:
+    """在字节预算内按故障域（failure_domain）公平地选择要保留的增量集合。
+
+    与 ``/retention-plan`` 复用同一套规则：增量整体校验（RFC 1982 严格 newer、
+    去重、字节数冲突、分叉均为 422），副本数不超过 12（422），逐副本沿完整
+    集合的增量链判定 ``ixfr`` / ``up_to_date`` / ``axfr``（``gap`` /
+    ``loop`` / ``target_incomparable`` / ``budget``）。每个副本额外携带
+    **非空** ``failure_domain``。
+
+    对任一保留子集，先把各 failure_domain 已覆盖（``ixfr`` 与
+    ``up_to_date``）副本的 priority 总和汇总后按**升序**排列成向量；在
+    ``used_bytes <= budget`` 的可行子集中依次：
+
+    1. 该升序向量**字典序最大**（优先抬高覆盖最差的域，即逐域 maximin）；
+    2. 全体已覆盖副本的 **priority 总和最大**；
+    3. 已覆盖**副本数最多**；
+    4. **占用字节最少**；
+    5. 取增量序列（按 from_serial、to_serial 升序）字典序最小者。
+
+    响应除 ``retained_deltas`` 与逐副本模式（回显 ``failure_domain``）外，
+    还按域给出 ``domain_summaries``：每个 failure_domain 的
+    ``covered_priority``（已覆盖副本 priority 总和）与 ``total_priority``
+    （该域全部副本 priority 总和）。相同输入恒得相同结果。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+    if len(request.replicas) > MAX_RETENTION_REPLICAS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "too_many_replicas",
+                "message": f"副本数不得超过 {MAX_RETENTION_REPLICAS}",
+                "limit": MAX_RETENTION_REPLICAS,
+                "got": len(request.replicas),
+            },
+        )
+
+    raw_deltas = [(d.from_serial, d.to_serial, d.bytes) for d in request.deltas]
+    try:
+        chain, sizes = build_sized_delta_chain(raw_deltas)
+    except DeltaValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    retained, used_bytes, modes, domain_summaries = plan_domain_retention(
+        request.target,
+        [
+            (r.current, r.priority, r.failure_domain)
+            for r in request.replicas
+        ],
+        chain,
+        sizes,
+        request.budget,
+    )
+
+    results = [
+        DomainRetentionPlanItem(
+            name=replica.name,
+            current=replica.current,
+            target=request.target,
+            failure_domain=replica.failure_domain,
+            mode=mode,
+            reason=reason,
+        )
+        for replica, (mode, reason) in zip(request.replicas, modes)
+    ]
+
+    return DomainRetentionPlanResponse(
+        target=request.target,
+        budget=request.budget,
+        used_bytes=used_bytes,
+        retained_deltas=[
+            RetainedDelta(from_serial=frm, to_serial=to, bytes=sizes[(frm, to)])
+            for frm, to in retained
+        ],
+        results=results,
+        domain_summaries=[
+            DomainSummary(
+                failure_domain=domain,
+                covered_priority=covered,
+                total_priority=total,
+            )
+            for domain, covered, total in domain_summaries
+        ],
     )

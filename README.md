@@ -317,18 +317,107 @@ curl -s http://localhost:8000/retention-plan \
 }
 ```
 
+### `POST /domain-retention-plan` — 按故障域公平的增量保留规划
+
+在 `/retention-plan` 的基础上为每个副本增加**非空** `failure_domain`（故障域，
+如机房 / 可用区），复用完全相同的增量校验、链路原因（`gap` / `loop` /
+`target_incomparable` / `budget`）与**最多 12 个副本**限制。
+优化目标从“全体 priority 总和”改为**逐故障域 maximin 公平**：
+
+对任一保留子集，先汇总每个 `failure_domain` 中已覆盖（`ixfr` 与 `up_to_date`）
+副本的 `priority` 总和，再把各域总和按**升序**排列成向量（向量包含请求中出现的
+**全部**域，按域名字典序固定分量顺序；该域无已覆盖副本时分量为 0）。
+在 `used_bytes <= budget` 的可行子集中**依次**裁决：
+
+1. 各域已覆盖 priority 总和的**升序向量字典序最大**
+   （先抬升覆盖最差的域，即逐域 maximin）；
+2. 全体已覆盖副本的 **priority 总和最大**；
+3. 已覆盖**副本数最多**；
+4. **占用字节最少**；
+5. 按 `(from_serial, to_serial)` 升序排列的**增量序列字典序最小**。
+
+> 第 1 级可能压倒“全体总和”：例如三域 `C / P / Q`，预算 20 时，
+> 覆盖 P(2+2) 与 Q(3) 得向量 `(0,3,4)`（总和 7），而只覆盖 C(6) 得向量
+> `(0,0,6)`（总和 6）——尽管 6 的单域值更大，但最小的非零分量 3 > 0，
+> 故仍选择均衡方案。
+
+请求（`failure_domain` 必填且非空）：
+
+```bash
+curl -s http://localhost:8000/domain-retention-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target": 4,
+    "budget": 12,
+    "replicas": [
+      {"name": "ns-a", "current": 1, "priority": 10, "failure_domain": "dc-east"},
+      {"name": "ns-b", "current": 3, "priority": 5,  "failure_domain": "dc-west"},
+      {"name": "ns-c", "current": 4, "priority": 100,"failure_domain": "dc-west"},
+      {"name": "ns-d", "current": 7, "priority": 1,  "failure_domain": "dc-east"}
+    ],
+    "deltas": [
+      {"from_serial": 3, "to_serial": 4, "bytes": 6},
+      {"from_serial": 1, "to_serial": 2, "bytes": 3},
+      {"from_serial": 2, "to_serial": 3, "bytes": 3}
+    ]
+  }'
+```
+
+响应（`retained_deltas` 与逐副本模式同 `/retention-plan`，逐副本结果回显
+`failure_domain`；新增按域名升序的 `domain_summaries`）：
+
+```json
+{
+  "target": 4,
+  "budget": 12,
+  "used_bytes": 12,
+  "retained_deltas": [
+    {"from_serial": 1, "to_serial": 2, "bytes": 3},
+    {"from_serial": 2, "to_serial": 3, "bytes": 3},
+    {"from_serial": 3, "to_serial": 4, "bytes": 6}
+  ],
+  "results": [
+    {"name": "ns-a", "current": 1, "target": 4, "failure_domain": "dc-east",
+     "mode": "ixfr", "reason": null},
+    {"name": "ns-b", "current": 3, "target": 4, "failure_domain": "dc-west",
+     "mode": "ixfr", "reason": null},
+    {"name": "ns-c", "current": 4, "target": 4, "failure_domain": "dc-west",
+     "mode": "up_to_date", "reason": null},
+    {"name": "ns-d", "current": 7, "target": 4, "failure_domain": "dc-east",
+     "mode": "axfr", "reason": "gap"}
+  ],
+  "domain_summaries": [
+    {"failure_domain": "dc-east", "covered_priority": 10, "total_priority": 11},
+    {"failure_domain": "dc-west", "covered_priority": 105, "total_priority": 105}
+  ]
+}
+```
+
+`domain_summaries` 中：
+
+- `covered_priority` = 该域最终被覆盖（`ixfr` / `up_to_date`）副本的 priority 总和；
+- `total_priority` = 该域**全部**副本的 priority 总和（含因 `budget` / `gap` /
+  `loop` / `target_incomparable` 未覆盖者），不随预算变化。
+
+与 `/retention-plan` 一样，预算无法保留任何完整链时仍返回 **200**
+（`retained_deltas` 为空、`used_bytes` 为 0；`up_to_date` 副本零成本仍计入
+`covered_priority`）。全部裁决键与输出排列均确定，**相同输入恒得相同结果**。
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
 
 - 序列号越界：必须为整数且在 `[0, 4294967295]`（即 `[0, 2^32-1]`）；
-- 副本名重复（`/audit`、`/propose`、`/transfer-plan`、`/retention-plan` 均检查）；
+- 副本名重复（`/audit`、`/propose`、`/transfer-plan`、`/retention-plan`、
+  `/domain-retention-plan` 均检查）；
 - 副本名为空 / `replicas` 为空数组；
 - `/transfer-plan` 额外检查：增量非严格 newer（`delta_not_strictly_newer`）、
   同一 `from_serial` 分叉（`delta_fork`）；
 - `/retention-plan` 额外检查：副本数超过 12（`too_many_replicas`）、
   相同增量携带不同 `bytes`（`delta_bytes_conflict`）、
-  `bytes` / `priority` / `budget` 为负数或非整数。
+  `bytes` / `priority` / `budget` 为负数或非整数；
+- `/domain-retention-plan` 额外检查：在 `/retention-plan` 全部校验之外，
+  每个副本的 `failure_domain` 必须为非空字符串（空白字符串同样被拒绝）。
 
 ## 算法说明
 
@@ -359,12 +448,23 @@ curl -s http://localhost:8000/retention-plan \
 再在同分子集中取增量序列（按 `(from_serial, to_serial)` 升序）字典序最小者。
 空子集恒可行（`budget >= 0`），故预算再小也能正常返回 200。
 
+`/domain-retention-plan` 复用同一需求集枚举（与 `plan_retention` 共用
+`build_sized_delta_chain` 与逐副本 `plan_transfer` 判定），区别仅在裁决键：
+先把请求中出现的 failure_domain 按名称升序固定编号，`up_to_date` 副本的
+priority 作为常量并入各域基值；对每个可行子集统计各域被覆盖 priority，
+将各域总和**升序排列**为元组，按
+`(升序域向量, 全体 priority, 覆盖副本数, -占用字节)` 字典序取最大，
+最后再以增量序列字典序最小破平手。域向量包含全部域（未覆盖域分量为 0），
+故分量排列不随子集变化；连同增量 / 域的固定排序，相同输入的结果完全可复现。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
 `/transfer-plan` 的去重、分叉、缺口、环路、回绕与正对点测试，
-以及 `/retention-plan` 的字节数冲突、共享链并集、三级平局裁决、
-`budget` 原因与零预算测试）：
+`/retention-plan` 的字节数冲突、共享链并集、三级平局裁决、
+`budget` 原因与零预算测试，以及 `/domain-retention-plan` 的逐域 maximin
+向量优先于全体总和、域向量锚定与排序、覆盖数 / 字节 / 增量序列平局裁决、
+covered/total 汇总与稳定性测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -376,12 +476,14 @@ python3 -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、/retention-plan）
+│   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
+│   │                  #   /retention-plan、/domain-retention-plan）
 │   ├── schemas.py     # 请求/响应模型与 422 校验
 │   └── serial.py      # RFC 1982 环形算术、增量链规划与保留规划（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
 ├── tests/test_retention_plan.py
+├── tests/test_domain_retention_plan.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml
